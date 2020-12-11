@@ -31,12 +31,33 @@
 #include "song/DetachedSong.hxx"
 #include "input/InputStream.hxx"
 #include "util/RuntimeError.hxx"
+#include "fs/Traits.hxx"
+#include "fs/AllocatedPath.hxx"
+#include "fs/NarrowPath.hxx"
+#include "util/ScopeExit.hxx"
+#include "tag/Builder.hxx"
+#include "Log.hxx"
+#include "decoder/plugins/FlacDomain.hxx"
 
 #include <FLAC/metadata.h>
+
+static char* get_vorbis_comment
+(const FLAC__StreamMetadata_VorbisComment &t, const char *tagname)
+{
+  unsigned taglen = strlen(tagname);
+  for (unsigned i = 0; i < t.num_comments; ++i) {
+    if (memcmp(t.comments[i].entry, tagname, taglen) == 0 &&
+        t.comments[i].entry[taglen] == '=') {
+      return (char *)&(t.comments[i].entry[taglen + 1]);
+    }
+  }
+  return nullptr;
+}
 
 static auto
 ToSongEnumerator(const char *uri,
 		 const FLAC__StreamMetadata_CueSheet &c,
+                 const FLAC__StreamMetadata_VorbisComment &t,
 		 const unsigned sample_rate,
 		 const FLAC__uint64 total_samples) noexcept
 {
@@ -57,11 +78,31 @@ ToSongEnumerator(const char *uri,
 		auto &song = *tail;
 		song.SetStartTime(SongTime::FromScale(start, sample_rate));
 		song.SetEndTime(SongTime::FromScale(end, sample_rate));
+
+                /* we are going to set TAG_TRACK and TAG_TITLE right now,
+                   but the rest of the metadata will be copied from the
+                   shared comments in flac_container_scan. */
+                TagBuilder tb(song.WritableTag());
+                char tagbuf[32];
+                snprintf(tagbuf, sizeof(tagbuf), "%u", i+1);
+                tb.AddItem(TAG_TRACK, tagbuf);
+                snprintf(tagbuf, sizeof(tagbuf), "TITLE[%u]", i+1);
+                auto tt = get_vorbis_comment(t, tagbuf);
+                FormatDebug(flac_domain, "comment %s is %s", tagbuf, tt);
+                if (tt != nullptr) tb.AddItem(TAG_TITLE, tt);
+                song.SetTag(tb.Commit());
 	}
+
+        /* drop any "songs" of zero length, which can happen because of
+           various cuesheet and parser artifacts */
+        songs.remove_if([](const DetachedSong &s){
+          return s.GetStartTime() == s.GetEndTime(); }
+          );
 
 	return std::make_unique<MemorySongEnumerator>(std::move(songs));
 }
 
+/*
 static std::unique_ptr<SongEnumerator>
 flac_playlist_open_stream(InputStreamPtr &&is)
 {
@@ -97,6 +138,38 @@ flac_playlist_open_stream(InputStreamPtr &&is)
 
 	return nullptr;
 }
+*/
+
+static std::unique_ptr<SongEnumerator>
+flac_playlist_open_uri(const char *uri, [[maybe_unused]] Mutex &mutex)
+{
+  if (!PathTraitsUTF8::IsAbsolute(uri))
+    /* only local files supported */
+    return nullptr;
+
+  const auto path_fs = AllocatedPath::FromUTF8Throw(uri);
+  const NarrowPath narrow_path_fs(path_fs);
+  FLAC__StreamMetadata *cuesheet;
+  if (!FLAC__metadata_get_cuesheet(narrow_path_fs, &cuesheet))
+    return nullptr;
+  FLAC__StreamMetadata *tags;
+  FLAC__metadata_get_tags(narrow_path_fs, &tags);
+  AtScopeExit(cuesheet) { FLAC__metadata_object_delete(cuesheet); };
+  AtScopeExit(tags) { FLAC__metadata_object_delete(tags); };
+
+  FLAC__StreamMetadata streaminfo;
+  if (!FLAC__metadata_get_streaminfo(narrow_path_fs, &streaminfo) ||
+      streaminfo.data.stream_info.sample_rate == 0) {
+    return nullptr;
+  }
+
+  const unsigned sample_rate = streaminfo.data.stream_info.sample_rate;
+  const FLAC__uint64 total_samples = streaminfo.data.stream_info.total_samples;
+
+  return ToSongEnumerator(uri, cuesheet->data.cue_sheet,
+                          tags->data.vorbis_comment,
+                          sample_rate, total_samples);
+}
 
 static const char *const flac_playlist_suffixes[] = {
 	"flac",
@@ -104,5 +177,5 @@ static const char *const flac_playlist_suffixes[] = {
 };
 
 const PlaylistPlugin flac_playlist_plugin =
-	PlaylistPlugin("flac", flac_playlist_open_stream)
+	PlaylistPlugin("flac", flac_playlist_open_uri)
 	.WithSuffixes(flac_playlist_suffixes);

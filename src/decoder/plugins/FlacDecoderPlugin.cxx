@@ -27,6 +27,19 @@
 #include "fs/Path.hxx"
 #include "fs/NarrowPath.hxx"
 #include "Log.hxx"
+#include "song/DetachedSong.hxx"
+#include "fs/AllocatedPath.hxx"
+#include "decoder/Bridge.hxx"
+#include "decoder/Control.hxx"
+#include "input/LocalOpen.hxx"
+#include "util/RuntimeError.hxx"
+#include "tag/Builder.hxx"
+#include "playlist/plugins/FlacPlaylistPlugin.hxx"
+#include "playlist/SongEnumerator.hxx"
+#include "playlist/PlaylistPlugin.hxx"
+#include "util/StringView.hxx"
+
+#define TRACK_PREFIX "track_"
 
 #if !defined(FLAC_API_VERSION_CURRENT) || FLAC_API_VERSION_CURRENT <= 7
 #error libFLAC is too old
@@ -358,6 +371,134 @@ oggflac_decode(DecoderClient &client, InputStream &input_stream)
 	flac_decode_internal(client, input_stream, true);
 }
 
+struct FlacContainerPath {
+	AllocatedPath path;
+	unsigned track;
+};
+
+gcc_pure
+static unsigned
+ParseTrackName(const char *base) noexcept
+{
+	if (memcmp(base, TRACK_PREFIX, sizeof(TRACK_PREFIX) - 1) != 0)
+		return 0;
+
+	base += sizeof(TRACK_PREFIX) - 1;
+
+	char *endptr;
+	auto track = strtoul(base, &endptr, 10);
+	if (endptr == base || *endptr != '.')
+		return 0;
+
+	return track;
+}
+
+/**
+ * returns the file path stripped of any /track_xxx.* track suffix
+ * and the track number (or 1 if no "track_xxx" suffix is present).
+ */
+static FlacContainerPath
+ParseContainerPath(Path path_fs)
+{
+	const Path base = path_fs.GetBase();
+	unsigned track;
+	if (base.IsNull() ||
+	    (track = ParseTrackName(base.c_str())) < 1)
+		return { AllocatedPath(path_fs), 0 };
+
+	return { path_fs.GetDirectoryName(), track };
+
+}
+
+static void
+flac_file_decode(DecoderClient &client, Path path_fs)
+{
+	FormatDebug(flac_domain,"flac_file_decode %s", path_fs.c_str());
+
+	/* load the track */
+	const auto container = ParseContainerPath(path_fs);
+
+	FormatDebug(flac_domain,"flac_file_decode %s", container.path.c_str());
+
+	DecoderBridge *bridge = (DecoderBridge*) &client;
+	DecoderControl &dc = bridge->dc;
+
+	auto is = OpenLocalInputStream(container.path, dc.mutex);
+
+	flac_decode(client, *is);
+}
+
+static void
+ScanSong(const DetachedSong &song, unsigned track, TagHandler &handler)
+{
+	/* title */
+	const char *title = song.GetTag().GetValue(TAG_TITLE);
+	if (title == nullptr) {
+		title = TRACK_PREFIX;
+		char tag_title[1024];
+		snprintf(tag_title, sizeof(tag_title),
+					 "%s%u",
+					 title, track);
+		handler.OnTag(TAG_TITLE, {tag_title, strlen(tag_title)});
+        }
+
+	/* duration */
+	handler.OnDuration(SongTime(song.GetDuration()));
+}
+
+static std::forward_list<DetachedSong>
+flac_container_scan(Path path_fs)
+{
+	/* load FLAC file */
+	DetachedSong *container = new DetachedSong(path_fs.c_str());
+	if (!container->LoadFile(path_fs))
+		throw FormatRuntimeError("Failed to open FLAC file %s", path_fs.c_str());
+	Tag tag_container = container->GetTag();
+	SignedSongTime container_duration = container->GetDuration();
+
+	/* open embedded CUE sheet */
+	Mutex mutex;
+	auto playlist = flac_playlist_plugin.open_uri(path_fs.c_str(), mutex);
+	if (playlist == nullptr)
+		throw FormatRuntimeError("Failed to open embedded CUE sheet in FLAC file %s", path_fs.c_str());
+	SongEnumerator &cuesheet = *playlist;
+
+	std::forward_list<DetachedSong> list;
+	auto tail = list.before_begin();
+	int i = 1;
+	std::unique_ptr<DetachedSong> song;
+	while ((song = cuesheet.NextSong()) != nullptr) {
+		DetachedSong &track = *song.get();
+
+		/* adjust end time of last track */
+		if (track.GetEndTime().IsZero())
+			track.SetEndTime(SongTime::FromMS(container_duration.ToMS()));
+
+		TagBuilder track_tag_builder(track.GetTag());
+		AddTagHandler h(track_tag_builder);
+		ScanSong(track, i, h);
+
+		/* merge container and track tags */
+		std::unique_ptr<Tag> tag = Tag::Merge(tag_container, track_tag_builder.Commit());
+
+		TagBuilder tag_builder(*tag);
+		tag_builder.SetHasPlaylist(false);
+
+		char track_name[32];
+		/* Construct container/track path names, eg.
+		   Delta.flac/track_001.flac */
+		sprintf(track_name, TRACK_PREFIX "%03u.flac", i++);
+		FormatDebug(flac_domain,"flac_container_scan %s", track_name);
+
+		track.SetURI(track_name);
+		track.SetTag(tag_builder.Commit());
+		tail = list.emplace_after(tail, *song.get());
+	}
+
+	delete container;
+	return list;
+}
+
 static const char *const oggflac_suffixes[] = { "ogg", "oga", nullptr };
 static const char *const oggflac_mime_types[] = {
 	"application/ogg",
@@ -386,6 +527,7 @@ static const char *const flac_mime_types[] = {
 
 constexpr DecoderPlugin flac_decoder_plugin =
 	DecoderPlugin("flac", flac_decode, flac_scan_stream,
-		      nullptr, flac_scan_file)
+		      flac_file_decode, flac_scan_file)
 	.WithSuffixes(flac_suffixes)
-	.WithMimeTypes(flac_mime_types);
+	.WithMimeTypes(flac_mime_types)
+	.WithContainer(flac_container_scan);

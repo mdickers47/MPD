@@ -21,6 +21,7 @@
 #define MPD_DECODER_PLUGIN_HXX
 
 #include "util/Compiler.h"
+#include "tag/Handler.hxx"
 
 #include <forward_list>  // IWYU pragma: export
 #include <set>
@@ -29,7 +30,6 @@
 
 struct ConfigBlock;
 class InputStream;
-class TagHandler;
 class Path;
 class DecoderClient;
 class DetachedSong;
